@@ -44,6 +44,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/alecthomas/kingpin/v2"
@@ -158,6 +159,10 @@ type ClientInitFunc func(cf *CLIConf) (*client.TeleportClient, error)
 
 // CLIConf stores command line arguments and flags:
 type CLIConf struct {
+	// FluxSFTPSocket은 SFTP 중계 소켓 경로다.
+	FluxSFTPSocket string
+	// FluxControlSocket은 세션 호스트 제어 소켓 경로다.
+	FluxControlSocket string
 	// Scope constrains the current operation to a specific target scope. A scope of "" descopes the user.
 	Scope string
 	// ScopeSetByUser specifies whether the flag was set by the user.
@@ -798,11 +803,22 @@ func (c *CLIConf) PromptConfirmation(question string) error {
 	return nil
 }
 
+// Main은 명령행 인자로 tsh를 실행하고 결과 종료 코드로 프로세스를 종료한다.
+// flux 브리지 실행에서는 SIGINT를 셸·브리지에 맡기고 SIGTERM·SIGHUP은 연결을 종료한다.
 func Main() {
 	cmdLineOrig := os.Args[1:]
 	var cmdLine []string
 
-	ctx, cancel := stacksignal.GetSignalHandler().NotifyContext(context.Background())
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if slices.ContainsFunc(cmdLineOrig, func(arg string) bool {
+		return arg == "--flux-sftp-socket" || strings.HasPrefix(arg, "--flux-sftp-socket=")
+	}) {
+		// 셸 종료 뒤 Ctrl-C가 상위 컨텍스트를 취소하면 finish를 기다릴 수 없다.
+		ctx, cancel = signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGHUP)
+	} else {
+		ctx, cancel = stacksignal.GetSignalHandler().NotifyContext(context.Background())
+	}
 	defer cancel()
 
 	// lets see: if the executable name is 'ssh' or 'scp' we convert
@@ -893,6 +909,8 @@ var tshStatusEnvVars = [...]string{proxyEnvVar, clusterEnvVar, siteEnvVar, kubeC
 // CliOption is used in tests to inject/override configuration within Run
 type CliOption func(*CLIConf) error
 
+// Run은 ctx, args, opts로 tsh를 실행하고 파싱·설정·명령 실행 오류를 반환한다.
+// 숨김 flux 소켓 플래그는 ssh의 host 앞에서만 해석한다.
 // Run executes TSH client. same as main() but easier to test. Note that this
 // function modifies global state in `tsh` (e.g. the system logger), and WILL
 // ALSO MODIFY EXTERNAL SHARED STATE in its default configuration (e.g. the
@@ -1026,6 +1044,8 @@ func Run(ctx context.Context, args []string, opts ...CliOption) error {
 	// ssh
 	// Use Interspersed(false) to forward all flags to ssh.
 	ssh := app.Command("ssh", "Run shell or execute a command on a remote SSH node.").Interspersed(false)
+	ssh.Flag("flux-sftp-socket", "flux SFTP socket.").Hidden().StringVar(&cf.FluxSFTPSocket)
+	ssh.Flag("flux-control-socket", "flux control socket.").Hidden().StringVar(&cf.FluxControlSocket)
 	ssh.Arg("[user@]host", "Remote hostname and the login to use, this argument is required.").StringVar(&cf.UserHost)
 	ssh.Arg("command", "Command to execute on a remote host.").StringsVar(&cf.RemoteCommand)
 	app.Flag("jumphost", "SSH jumphost.").Short('J').StringVar(&cf.ProxyJump)
@@ -2245,7 +2265,8 @@ func initializeTracing(cf *CLIConf) func() {
 	return flush(provider)
 }
 
-// onVersion prints version info.
+// onVersion은 cf의 출력 형식과 client 전용 설정에 따라 버전 정보를 출력한다.
+// cf는 명령 설정이며, 지원하지 않는 형식이나 직렬화 오류를 반환한다.
 func onVersion(cf *CLIConf) error {
 	proxyVersion := ""
 	proxyPublicAddr := ""
@@ -2271,8 +2292,11 @@ func onVersion(cf *CLIConf) error {
 		if reExecFromVersion != "" {
 			fmt.Printf("Re-executed from version: %s\n", reExecFromVersion)
 		}
+		if cf.clientOnlyChecks {
+			fmt.Println("flux-sftp-bridge: 1")
+		}
 	case teleport.JSON, teleport.YAML:
-		out, err := serializeVersion(format, proxyVersion, proxyPublicAddr, reExecFromVersion)
+		out, err := serializeVersion(format, proxyVersion, proxyPublicAddr, reExecFromVersion, cf.clientOnlyChecks)
 		if err != nil {
 			return trace.Wrap(err)
 		}
@@ -2319,7 +2343,10 @@ type benchKubeOptions struct {
 	namespace string
 }
 
-func serializeVersion(format string, proxyVersion string, proxyPublicAddress string, reExecFromVersion string) (string, error) {
+// serializeVersion은 format에 맞춰 버전 정보를 직렬화한 문자열과 직렬화 오류를 반환한다.
+// proxyVersion, proxyPublicAddress, reExecFromVersion은 선택적 서버·재실행 정보다.
+// clientOnly의 첫 값이 true일 때만 flux 브리지 표식을 포함하며, 생략하면 기존 출력을 유지한다.
+func serializeVersion(format string, proxyVersion string, proxyPublicAddress string, reExecFromVersion string, clientOnly ...bool) (string, error) {
 	versionInfo := struct {
 		Version               string `json:"version"`
 		Gitref                string `json:"gitref"`
@@ -2327,6 +2354,7 @@ func serializeVersion(format string, proxyVersion string, proxyPublicAddress str
 		ProxyVersion          string `json:"proxyVersion,omitempty"`
 		ProxyPublicAddress    string `json:"proxyPublicAddress,omitempty"`
 		ReExecutedFromVersion string `json:"reExecutedFromVersion,omitempty"`
+		FluxSFTPBridge      int    `json:"flux-sftp-bridge,omitempty"`
 	}{
 		teleport.Version,
 		teleport.Gitref,
@@ -2334,6 +2362,10 @@ func serializeVersion(format string, proxyVersion string, proxyPublicAddress str
 		proxyVersion,
 		proxyPublicAddress,
 		reExecFromVersion,
+		0,
+	}
+	if len(clientOnly) > 0 && clientOnly[0] {
+		versionInfo.FluxSFTPBridge = 1
 	}
 	var out []byte
 	var err error
@@ -4563,7 +4595,8 @@ func onResolve(cf *CLIConf) error {
 	return nil
 }
 
-// onSSH executes 'tsh ssh' command
+// onSSH는 cf의 SSH 설정과 initFunc 초기화 콜백으로 tsh ssh를 실행한다.
+// 설정 검증·인증·연결·실행 오류를 반환한다.
 func onSSH(cf *CLIConf, initFunc ClientInitFunc) error {
 	// Handle fork after authentication.
 	var disownSignal *os.File
@@ -4629,6 +4662,9 @@ func onSSH(cf *CLIConf, initFunc ClientInitFunc) error {
 	err = retryWithAccessRequest(cf, tc, func() error {
 		sshFunc := func() error {
 			var opts []func(*client.SSHOptions)
+			if cf.FluxSFTPSocket != "" || cf.FluxControlSocket != "" {
+				opts = append(opts, client.WithFluxSFTPSockets(cf.FluxSFTPSocket, cf.FluxControlSocket))
+			}
 			if cf.LocalExec {
 				opts = append(opts, client.WithLocalCommandExecutor(runLocalCommand))
 			}

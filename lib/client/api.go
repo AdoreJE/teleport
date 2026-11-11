@@ -1941,6 +1941,10 @@ func (tc *TeleportClient) NewTracingClient(ctx context.Context) (*apitracing.Cli
 // SSHOptions allow overriding configuration
 // used when connecting to a host via [TeleportClient.SSH].
 type SSHOptions struct {
+	// FluxSFTPSocket은 같은 노드 연결의 SFTP 바이트 중계 소켓이다.
+	FluxSFTPSocket string
+	// FluxControlSocket은 세션 호스트의 제어 소켓이다.
+	FluxControlSocket string
 	// HostAddress is the address of the target host. If specified it
 	// will be used instead of the target provided when `tsh ssh` was invoked.
 	HostAddress string
@@ -1983,10 +1987,9 @@ func WithForkAfterAuthentication(onAuthenticate func() error) func(*SSHOptions) 
 	}
 }
 
-// SSH connects to a node and, if 'command' is specified, executes the command on it,
-// otherwise runs interactive shell
-//
-// Returns nil if successful, or (possibly) *exec.ExitError
+// SSH는 ctx, command, opts로 노드에 연결해 명령 또는 대화형 셸을 실행한다.
+// 성공 시 nil, 설정·대상 조회·인증·연결·실행 오류 또는 *exec.ExitError를 반환한다.
+// flux 브리지는 단일 노드의 대화형 셸에만 허용한다.
 func (tc *TeleportClient) SSH(ctx context.Context, command []string, opts ...func(*SSHOptions)) error {
 	ctx, span := tc.Tracer.Start(
 		ctx,
@@ -2002,6 +2005,10 @@ func (tc *TeleportClient) SSH(ctx context.Context, command []string, opts ...fun
 	var options SSHOptions
 	for _, opt := range opts {
 		opt(&options)
+	}
+
+	if err := validateFluxSFTPOptions(options, command, tc.NoRemoteExec); err != nil {
+		return err
 	}
 
 	// connect to proxy first:
@@ -2025,6 +2032,9 @@ func (tc *TeleportClient) SSH(ctx context.Context, command []string, opts ...fun
 	}
 
 	if len(nodeAddrs) > 1 {
+		if options.FluxSFTPSocket != "" {
+			return trace.BadParameter("flux bridge requires exactly one target node")
+		}
 		if options.forkAfterAuthentication() {
 			return &NonRetryableError{
 				Err: trace.BadParameter("fork after authentication not supported for commands on multiple nodes"),
@@ -2226,6 +2236,8 @@ func (tc *TeleportClient) connectToNodeWithMFA(ctx context.Context, clt *Cluster
 	return nodeClient, trace.Wrap(err)
 }
 
+// runShellOrCommandOnSingleNode는 ctx, clt, nodeAddr, command, options로 단일 노드 셸 또는 명령을 실행한다.
+// 연결·세션·브리지 오류를 반환하며 브리지 finish까지 셸 종료 상태를 보존한다.
 func (tc *TeleportClient) runShellOrCommandOnSingleNode(ctx context.Context, clt *ClusterClient, nodeAddr string, command []string, options SSHOptions) error {
 	cluster := clt.ClusterName()
 	ctx, span := tc.Tracer.Start(
@@ -2297,6 +2309,9 @@ func (tc *TeleportClient) runShellOrCommandOnSingleNode(ctx context.Context, clt
 	if len(command) > 0 {
 		// Reuse the existing nodeClient we connected above.
 		return nodeClient.RunCommand(ctx, command)
+	}
+	if options.FluxSFTPSocket != "" {
+		return tc.runFluxSFTPShell(ctx, nodeClient, options)
 	}
 	return trace.Wrap(nodeClient.RunInteractiveShell(ctx, "", "", nil))
 }

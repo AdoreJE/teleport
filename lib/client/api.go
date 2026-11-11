@@ -4216,12 +4216,16 @@ func (tc *TeleportClient) pwdlessLogin(ctx context.Context, keyRing *KeyRing) (*
 		return nil, trace.Wrap(err)
 	}
 
+	webauthnLogin := tc.WebauthnLogin
+	if tc.PreferBrowser && webauthnLogin == nil {
+		webauthnLogin = browserPasswordlessLogin(tc.Stderr, tc.stdin())
+	}
 	response, err := SSHAgentPasswordlessLogin(ctx, SSHLoginPasswordless{
 		SSHLogin:                sshLogin,
 		User:                    user,
 		AuthenticatorAttachment: tc.AuthenticatorAttachment,
 		StderrOverride:          tc.Stderr,
-		WebauthnLogin:           tc.WebauthnLogin,
+		WebauthnLogin:           webauthnLogin,
 	})
 
 	return response, trace.Wrap(err)

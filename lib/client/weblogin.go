@@ -22,6 +22,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -31,6 +32,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/go-webauthn/webauthn/protocol"
@@ -43,6 +45,7 @@ import (
 	"github.com/gravitational/teleport/api/mfa"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/api/utils/keys/hardwarekey"
+	"github.com/gravitational/teleport/api/utils/prompt"
 	"github.com/gravitational/teleport/lib/auth/authclient"
 	wancli "github.com/gravitational/teleport/lib/auth/webauthncli"
 	wantypes "github.com/gravitational/teleport/lib/auth/webauthntypes"
@@ -51,6 +54,8 @@ import (
 	"github.com/gravitational/teleport/lib/httplib"
 	websession "github.com/gravitational/teleport/lib/web/session"
 )
+
+const webauthnBrowserRequestPrefix = "TELEPORT_WEBAUTHN_REQUEST:"
 
 const (
 	// HTTPS is https prefix
@@ -554,6 +559,37 @@ func SSHAgentPasswordlessLogin(ctx context.Context, login SSHLoginPasswordless) 
 		return nil, trace.Wrap(err)
 	}
 	return loginResp, nil
+}
+
+// browserPasswordlessLogin은 stderr 출력과 stdin 입력으로 마커 로그인을 만들고, FD 환경변수가 있으면 브리지 콜백을 반환한다.
+// 반환 콜백은 challenge 검증, 입력 및 assertion 디코딩 오류를 호출자에게 전달한다.
+// browserPasswordlessLogin delegates the WebAuthn assertion to a browser host.
+// The request is public challenge data; the response is read with terminal echo
+// disabled so the signed assertion is not copied into terminal logs.
+func browserPasswordlessLogin(stderr io.Writer, stdin prompt.StdinReader) WebauthnLoginFunc {
+	if fd, ok := os.LookupEnv("TSH_WEBAUTHN_BRIDGE_FD"); ok {
+		return newWebauthnBridgeLogin(fd)
+	}
+	return func(ctx context.Context, _ string, assertion *wantypes.CredentialAssertion, _ wancli.LoginPrompt, _ *wancli.LoginOpts) (*proto.MFAAuthenticateResponse, string, error) {
+		if err := assertion.Validate(); err != nil {
+			return nil, "", trace.Wrap(err)
+		}
+		request, err := json.Marshal(assertion)
+		if err != nil {
+			return nil, "", trace.Wrap(err)
+		}
+		fmt.Fprintf(stderr, "%s%s\n", webauthnBrowserRequestPrefix, base64.RawURLEncoding.EncodeToString(request))
+
+		encodedResponse, err := stdin.ReadPassword(ctx)
+		if err != nil {
+			return nil, "", trace.Wrap(err)
+		}
+		responseJSON, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(string(encodedResponse)))
+		if err != nil {
+			return nil, "", trace.BadParameter("invalid browser WebAuthn response encoding")
+		}
+		return decodeWebauthnBridgeAssertion(responseJSON)
+	}
 }
 
 // SSHAgentMFALogin requests a MFA challenge via the proxy.

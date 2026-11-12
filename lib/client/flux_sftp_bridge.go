@@ -9,7 +9,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"os"
@@ -351,7 +350,6 @@ drainInterrupts:
 	}
 	status := tc.ExitStatus()
 	b.emit(fluxBridgeEvent{Type: "shellExited", Status: &status})
-	fmt.Fprintln(tc.Stderr, "전송이 끝나면 종료합니다. Ctrl-C로 중단")
 	for {
 		select {
 		case <-interrupts:
